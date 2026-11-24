@@ -6595,8 +6595,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
         && device.adminUserId !== null
         && ppcsStreamRoute(device, this.#devices)?.homeBaseAttached === true
         && isPpcsRouteReady(device, this.#devices, dskPeerSerials),
-      directionalPanControlSupported: this.#c37ControlRouteReady(device)
-        || PanTiltController !== null && this.#panTiltAdmitted(device, PanTiltController),
+      directionalPanControlSupported: PanTiltController !== null && this.#panTiltAdmitted(device, PanTiltController),
       experimentalQuickResponseSupported: this.config.experimentalModelControls === true
         && this.config.apiAuthenticationConfigured === true && this.#client.authenticatedBinding() !== null
         && route !== null && isQuickResponseRoute(this.#modelTrialRoute(device, route)) && isPpcsRouteReady(device, this.#devices, dskPeerSerials),
@@ -6901,26 +6900,23 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
     })();
   }
 
-  /** Select a registered controller; legacy unregistered controls retain their original path. */
+  /** Select the device protocol; existing standalone controls retain their queue and connection lifecycle. */
   panCamera(serial: string, direction: "left" | "right" | "up" | "down"): Promise<void> {
     this.#assertRtcPreparationIdle();
     this.#assertLegacyCamera(serial);
     this.#assertNoModelTrial(serial);
     const selected = this.#devices.get(serial);
-    const Controller = selected && panTiltDevice(selected, ppcsStreamRoute(selected, this.#devices));
-    if (selected && Controller && this.#panTiltAdmitted(selected, Controller) && ["left", "right", "up", "down"].includes(direction)) {
-      return this.#panTiltThroughHomeBase(selected, direction, Controller);
-    }
-    if (!["left", "right", "up", "down"].includes(direction) || !selected || !this.#c37ControlRouteReady(selected)) {
+    const route = selected ? ppcsStreamRoute(selected, this.#devices) : null;
+    const Controller = selected && panTiltDevice(selected, route);
+    if (!["left", "right", "up", "down"].includes(direction) || !selected || !route || !Controller || !this.#panTiltAdmitted(selected, Controller)) {
       return Promise.reject(new Error("Direct camera movement is unavailable"));
     }
+    if (Controller.connectionPath === "homebase") {
+      return this.#panTiltThroughHomeBase(selected, direction, Controller);
+    }
     return this.#queuePanControl(serial, "pan", async (session, current, observe) => {
-      const device = this.#devices.get(serial)!;
-      const route = ppcsStreamRoute(device, this.#devices)!;
-      current();
       observe("write");
-      await session.writeModelControlTrial({ action: "ptz", direction }, this.#modelTrialRoute(device, route), current);
-      current();
+      await session.movePanTilt(direction, current, transport => new Controller(transport, selected.channel!));
     });
   }
 

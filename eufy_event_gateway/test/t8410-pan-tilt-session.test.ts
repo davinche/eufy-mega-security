@@ -7,6 +7,7 @@ import { createCipheriv, createDecipheriv, createECDH, createHmac } from "node:c
 import { Socket } from "node:dgram";
 import test, { type TestContext } from "node:test";
 import { T8410 } from "../src/stream/t8410-pan-tilt.js";
+import { C37 } from "../src/stream/c37-pan-tilt.js";
 import { FirstPartyPpcsSession } from "../src/stream/first-party-ppcs.js";
 
 /** Deliver a synthetic XZYH frame through the real session's socket listener. */
@@ -17,7 +18,7 @@ function deliver(socket:Socket,command:number,payload:Buffer,sign=0,sequence=0,c
 }
 
 /** Negotiate a real synthetic level-two key without network access or private-field hooks. */
-async function peer(context:TestContext, purpose: "media" | "control" | "passive" | undefined, channel = 2) {
+async function peer(context:TestContext, purpose: "media" | "control" | "passive" | undefined, channel = 2, attached = true) {
   let socket!:Socket;const sent:Buffer[]=[];
   context.mock.method(Socket.prototype,"bind",function(this:Socket){socket=this;queueMicrotask(()=>this.emit("message",Buffer.from([0xf1,0x42,0,0]),{address:"127.0.0.1",port:12345}));return this;});
   context.mock.method(Socket.prototype,"send",function(data:Buffer){sent.push(Buffer.from(data));});
@@ -33,7 +34,7 @@ async function peer(context:TestContext, purpose: "media" | "control" | "passive
   const wrap=createCipheriv("aes-128-cbc",derived.subarray(0,16),iv);Buffer.concat([wrap.update(key),wrap.final()]).copy(envelope,49);
   const plain=Buffer.alloc(144);plain.writeUInt16LE(1);envelope.copy(plain,4);
   const legacy=createCipheriv("aes-128-ecb",Buffer.from("1234567-12345678"),null);legacy.setAutoPadding(false);
-  const session=new FirstPartyPpcsSession({stationSerial:"SYNTHETIC1234567",p2pDid:"TEST-12345678-TEST",appConnection:"",dskKey:"synthetic",channel,homeBaseAttached:true,cameraModel:"T81A0",stationModel:"T8030",stationDeviceType:18,accountId:"synthetic-account",...(purpose ? {purpose} : {}),resolveCipherKey:async()=>recipient.getPrivateKey().toString("hex")});
+  const session=new FirstPartyPpcsSession({stationSerial:"SYNTHETIC1234567",p2pDid:"TEST-12345678-TEST",appConnection:"",dskKey:"synthetic",channel,homeBaseAttached:attached,cameraModel:attached?"T81A0":"T814X",cameraDeviceType:attached?31:10037,stationModel:attached?"T8030":"T814X",stationDeviceType:attached?18:10037,accountId:"synthetic-account",...(purpose ? {purpose} : {}),resolveCipherKey:async()=>recipient.getPrivateKey().toString("hex")});
   await session.start();deliver(socket,1100,Buffer.concat([legacy.update(plain),legacy.final()]),1);
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(session.stats.level2,1);
@@ -206,6 +207,60 @@ test("controller transport decodes protected receipts only for its target channe
       });
       return controller;
     });
+    assert.equal(session.stats.closeReason, "open");
+  } finally { session.close(); }
+});
+
+for (const result of [0, -1]) test(`registered C37 preserves its standalone envelope and encrypted result ${result}`, async context => {
+  const { session, socket, sent } = await peer(context, "control", 0, false);
+  const before = sent.length;
+  let settled = false;
+  const operation = session.movePanTilt("left", () => {}, transport => new C37(transport, 0), 0)
+    .then(() => { settled = true; });
+  void operation.catch(() => {});
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    const commands = sent.slice(before).filter(packet => packet.indexOf("XZYH") >= 0);
+    assert.equal(commands.length, 1);
+    const packet = commands[0]!, offset = packet.indexOf("XZYH");
+    assert.equal(packet.readUInt16LE(offset + 4), 1700);
+    assert.equal(packet[offset + 12], 0);
+    assert.equal(packet[offset + 13], 1);
+    const key = Buffer.from("1234567-12345678");
+    const decipher = createDecipheriv("aes-128-ecb", key, null);
+    decipher.setAutoPadding(false);
+    const plain = Buffer.concat([decipher.update(packet.subarray(offset + 16)), decipher.final()]).toString().replace(/\0+$/, "");
+    const value = JSON.parse(plain);
+    assert.deepEqual(value, { commandType: 6030, data: {
+      cmd_type: 1, rotate_type: 1, zoom: 1, ivalue: -1, transaction: value.data.transaction,
+    } });
+    assert.match(value.data.transaction, /^\d{13}$/);
+    deliver(socket, 1700, Buffer.alloc(4), 0, 1, 1, true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false);
+    const cipher = createCipheriv("aes-128-ecb", key, null);
+    cipher.setAutoPadding(false);
+    const clearReceipt = Buffer.alloc(16);
+    clearReceipt.writeInt32LE(result);
+    const receipt = Buffer.concat([cipher.update(clearReceipt), cipher.final()]);
+    const completion = result === 0 ? operation : assert.rejects(operation, /movement rejected \(-1\)/);
+    deliver(socket, 1700, receipt, 1, 2, 0, true);
+    await completion;
+    assert.equal(sent.filter(packet => {
+      const at = packet.indexOf("XZYH");
+      return at >= 0 && packet.readUInt16LE(at + 4) === 1700;
+    }).length, 1);
+    assert.equal(session.stats.closeReason, "open");
+  } finally { session.close(); await operation.catch(() => {}); }
+});
+
+test("registered C37 cannot borrow a standalone media viewer", async context => {
+  const { session, sent } = await peer(context, "media", 0, false);
+  session.stats.videoOutputFrames = 1;
+  const before = sent.length;
+  try {
+    await assert.rejects(session.movePanTilt("left", () => {}, transport => new C37(transport, 0), 0), /unavailable/);
+    assert.equal(sent.length, before);
     assert.equal(session.stats.closeReason, "open");
   } finally { session.close(); }
 });
