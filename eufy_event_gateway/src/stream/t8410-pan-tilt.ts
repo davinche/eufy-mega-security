@@ -5,6 +5,7 @@ import { PanTiltController, type PpcsControlTransport, type PanTiltDirection } f
 
 export class T8410 extends PanTiltController {
   static readonly requiresOwnerAccount = false;
+  static readonly connectionPath = "homebase";
   constructor(transport: PpcsControlTransport, channel: number) { super("T8410", transport, channel); }
 
   static supports(device: MegaInventoryDevice, route: PpcsStreamRoute | null): boolean {

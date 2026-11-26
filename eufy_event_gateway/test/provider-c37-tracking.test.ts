@@ -55,6 +55,20 @@ async function fixture(context: TestContext, mode = "ready") {
     this.stats.closeReason = "client_stop"; this.output.end();
   });
   const writes: boolean[] = [];
+  const panCommands: { command: number; value: unknown; channel: number }[] = [];
+  const pan = context.mock.method(FirstPartyPpcsSession.prototype, "movePanTilt", async (...[direction, current, create]: Parameters<FirstPartyPpcsSession["movePanTilt"]>) => {
+    const controller = create({
+      isConnected: () => true,
+      decodeResult: () => 0,
+      sendJson: async (command, value, channel, check) => {
+        check();
+        panCommands.push({ command, value: JSON.parse(value), channel });
+        controller.handleFrame(Buffer.alloc(16), Buffer.alloc(4), 0);
+      },
+    });
+    try { await controller.movePanTilt(direction, current); }
+    finally { controller.close(); }
+  });
   context.mock.method(FirstPartyPpcsSession.prototype, "writeAiTracking", async () => { assert.fail("C37 must not use the C31 serializer"); });
   context.mock.method(FirstPartyPpcsSession.prototype, "writeModelControlTrial", async (request: ModelControlTrial, _route: ModelControlRoute, current?: () => void) => {
     current?.(); assert.equal(request.action, "aiTracking");
@@ -74,7 +88,7 @@ async function fixture(context: TestContext, mode = "ready") {
     persistentDirectory: directory, maxStreamSeconds: 120, experimentalModelControls: mode !== "disabled",
     apiAuthenticationConfigured: mode !== "no-api-auth" });
   await provider.start(events);
-  return { provider, cameras, inventory, start, close, writes, sessions, query, move, moves,
+  return { provider, cameras, inventory, start, close, writes, sessions, query, move, moves, pan, panCommands,
     rebind: async (field = "owner") => {
       if (field === "owner") owner = "other-owner"; else did = "TEST-87654321-TEST";
       refreshes.at(-1)!(); await tick(); await tick();
@@ -111,20 +125,61 @@ test("queued C37 actions cannot follow a replacement connection binding", async 
 
 for (const direction of ["left", "right", "up", "down"] as const) test(`C37 HA movement sends one ${direction} click`, async context => {
   const f = await fixture(context, "missing-state");
-  const write = context.mock.method(FirstPartyPpcsSession.prototype, "writeModelControlTrial", async (
-    request: ModelControlTrial, route: ModelControlRoute, current?: () => void,
-  ) => {
-    current?.();
-    assert.deepEqual(request, { action: "ptz", direction });
-    assert.equal(route.model, "T814X");
-    assert.equal(route.deviceType, 10037);
-  });
+  const reads = f.inventory.mock.callCount();
   try {
     assert.equal(f.cameras.get("synthetic-camera")?.directionalPanControlSupported, true);
     await f.provider.panCamera("synthetic-camera", direction);
-    assert.equal(write.mock.callCount(), 1);
+    assert.equal(f.pan.mock.callCount(), 1);
+    assert.equal(f.inventory.mock.callCount(), reads + 1);
+    assert.equal(f.panCommands.length, 1);
+    assert.deepEqual(f.panCommands[0], { command: 1700, channel: 0, value: { commandType: 6030, data: {
+      cmd_type: 1, rotate_type: { left: 1, right: 2, up: 3, down: 4 }[direction],
+      zoom: 1, ivalue: -1, transaction: (f.panCommands[0]!.value as { data: { transaction: string } }).data.transaction,
+    } } });
     assert.equal(f.close.mock.callCount(), 1);
   } finally { await f.dispose(); }
+});
+
+test("registered C37 movements retain the existing queue and keep one active session", async context => {
+  const f = await fixture(context);
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let calls = 0;
+  f.pan.mock.mockImplementation(async (_direction: unknown, current: () => void) => {
+    if (++calls === 1) { enter(); await held; }
+    current();
+  });
+  const first = f.provider.panCamera("synthetic-camera", "left");
+  const second = f.provider.panCamera("synthetic-camera", "right");
+  const complete = Promise.all([first, second]);
+  void complete.catch(() => {});
+  try {
+    await entered;
+    assert.equal(calls, 1);
+    assert.equal(f.start.mock.callCount(), 1);
+    release();
+    await complete;
+    assert.equal(calls, 2);
+    assert.equal(f.close.mock.callCount(), 2);
+  } finally { release(); await complete.catch(() => {}); await f.dispose(); }
+});
+
+test("queued registered movement rejects a changed binding before dispatch", async context => {
+  const f = await fixture(context);
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  f.pan.mock.mockImplementation(async (_direction: unknown, current: () => void) => { enter(); await held; current(); });
+  const first = assert.rejects(f.provider.panCamera("synthetic-camera", "left"), /changed|retired/);
+  await entered;
+  const second = assert.rejects(f.provider.panCamera("synthetic-camera", "right"), /changed|retired/);
+  try {
+    await f.rebind("did");
+    release();
+    await Promise.all([first, second]);
+    assert.equal(f.pan.mock.callCount(), 1);
+  } finally { release(); await f.dispose(); }
 });
 
 for (const mode of ["disabled", "no-api-auth", "guest", "type", "model", "attached", "channel", "route"]) {
@@ -133,9 +188,12 @@ for (const mode of ["disabled", "no-api-auth", "guest", "type", "model", "attach
     try {
       assert.notEqual(f.cameras.get("synthetic-camera")?.directionalPanControlSupported, true);
       assert.notEqual(f.cameras.get("synthetic-camera")?.cameraLightControlSupported, true);
+      assert.deepEqual(f.provider.modelControlTrials("synthetic-camera"), []);
+      await assert.rejects(f.provider.performModelControlTrial("synthetic-camera", { action: "ptz", direction: "left" }), /unavailable/);
       await assert.rejects(f.provider.panCamera("synthetic-camera", "left"));
       await assert.rejects(f.provider.setCameraLight("synthetic-camera", true));
       assert.equal(f.start.mock.callCount(), 0);
+      assert.equal(f.pan.mock.callCount(), 0);
     } finally { await f.dispose(); }
   });
 }
@@ -173,16 +231,16 @@ for (const action of ["pan", "light"] as const) test(`C37 HA ${action} leaves an
       ? f.provider.panCamera("synthetic-camera", "up") : f.provider.setCameraLight("synthetic-camera", true), /live view/);
     assert.equal(f.start.mock.callCount(), 1);
     assert.equal(f.close.mock.callCount(), 0);
+    assert.equal(f.pan.mock.callCount(), 0);
   } finally { await f.dispose(); }
 });
 
 test("C37 HA movement refuses a changed connection after session startup", async context => {
   const f = await fixture(context);
   context.mock.method(FirstPartyPpcsSession.prototype, "start", async () => { await f.rebind("did"); });
-  const write = context.mock.method(FirstPartyPpcsSession.prototype, "writeModelControlTrial", async () => { assert.fail("Retired movement cannot write"); });
   try {
     await assert.rejects(f.provider.panCamera("synthetic-camera", "left"), /changed|retired/);
-    assert.equal(write.mock.callCount(), 0);
+    assert.equal(f.pan.mock.callCount(), 0);
     assert.equal(f.close.mock.callCount(), 1);
   } finally { await f.dispose(); }
 });
@@ -363,6 +421,7 @@ test("C37 movement is an explicitly armed one-click trial without guessed positi
     assert.equal(result.outcome, "acknowledged");
     assert.equal(result.physicalConfirmationRequired, true);
     assert.deepEqual(requests, [{ action: "ptz", direction: "left" }]);
+    assert.equal(f.pan.mock.callCount(), 0);
     assert.equal(read.mock.callCount(), 0);
     assert.equal(f.close.mock.callCount(), 1);
   } finally { await f.dispose(); }
